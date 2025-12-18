@@ -1,0 +1,15 @@
+{
+  "name": "Affiliate Deals Automation",
+  "nodes": [
+    {
+      "name": "Trigger",
+      "type": "cron",
+      "schedule": "*/30 * * * *"
+    },
+    {
+      "name": "Run Python Script",
+      "type": "executeCommand",
+      "command": "python scheduler/run_pipeline.py"
+    }
+  ]
+}
