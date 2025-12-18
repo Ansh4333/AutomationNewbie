@@ -1,0 +1,224 @@
+
+# Excel Data Cleaning Automation - Generic & Robust Script
+import pandas as pd
+import numpy as np
+from dateutil.parser import parse
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+
+INPUT_PATH = r"D/user/data/Online-Store-Orders.xlsx"
+OUTPUT_CLEANED = r"D/user/data/cleaned_output.xlsx"
+OUTPUT_REPORT = r"D/user/data/cleaning_report.xlsx"
+
+# Config
+DROP_COL_THRESHOLD = 0.9  # drop columns with >90% missing by default
+MAX_UNIQUE_FOR_CATEGORY = 200  #  object columns with < this unique values as categorical
+
+# Helpers
+def try_parse_date_series(s):
+    # First try pandas automatic
+    out = pd.to_datetime(s, errors='coerce', infer_datetime_format=True)
+    if out.notna().sum() > 0:
+        return out
+    # Fallback: try python-dateutil parse elementwise (slower)
+    def parse_or_none(x):
+        try:
+            if pd.isna(x):
+                return pd.NaT
+            return parse(str(x), dayfirst=False)
+        except Exception:
+            return pd.NaT
+    return s.map(parse_or_none)
+
+def standardize_text_series(s, column_name=""):
+    s = s.astype("string").replace({"<NA>": pd.NA})
+    s = s.str.strip().str.replace(r"\s+", " ", regex=True)
+    # If column looks like email:
+    if column_name.lower() in ("email", "e-mail") or s.dropna().str.contains(r"@").any():
+        return s.str.lower()
+    # For long strings (descriptions), do not title-case to preserve intent:
+    if s.dropna().map(len).median() > 30:
+        return s
+    # Otherwise title-case (keeps acronyms weird, but looks clean)
+    return s.str.title()
+
+def fill_missing(df, numeric_cols, categorical_cols, date_cols):
+    """Fill missing values intelligently."""
+    for col in numeric_cols:
+        median = df[col].median(skipna=True)
+        if np.isnan(median):
+            median = 0
+        df[col] = df[col].fillna(median)
+
+    for col in categorical_cols:
+        # Fill with mode if exists, otherwise "Unknown"
+        try:
+            mode = df[col].mode(dropna=True)
+            fill_val = mode.iloc[0] if len(mode) > 0 else "Unknown"
+        except Exception:
+            fill_val = "Unknown"
+        df[col] = df[col].fillna(fill_val)
+
+    for col in date_cols:
+        # leave NaT if can't parse; 
+        df[col] = df[col]
+
+    return df
+
+def summarize_dataframe(df):
+    info = {
+        "rows": df.shape[0],
+        "columns": df.shape[1],
+        "dtypes": df.dtypes.astype(str).to_dict(),
+        "missing_counts": df.isna().sum().to_dict(),
+        "missing_percent": (df.isna().mean() * 100).round(2).to_dict(),
+        "unique_counts": df.nunique(dropna=True).to_dict()
+    }
+    return info
+
+def main():
+    if not os.path.exists(INPUT_PATH):
+        raise FileNotFoundError(f"Input file not found: {INPUT_PATH}")
+
+    print("Loading dataset...")
+    df = pd.read_excel(INPUT_PATH, sheet_name=0)  # first sheet by default
+    original_shape = df.shape
+    print(f"Original rows: {original_shape[0]}, columns: {original_shape[1]}")
+
+    # 0. Remove totally empty rows
+    df = df.dropna(how='all').reset_index(drop=True)
+
+    # 1. Drop columns with too many missing values
+    missing_frac = df.isna().mean()
+    cols_to_drop = missing_frac[missing_frac > DROP_COL_THRESHOLD].index.tolist()
+    if cols_to_drop:
+        print(f"Dropping {len(cols_to_drop)} columns with >{int(DROP_COL_THRESHOLD*100)}% missing: {cols_to_drop}")
+        df = df.drop(columns=cols_to_drop)
+
+    before_dupes = df.shape[0]
+    df = df.drop_duplicates().reset_index(drop=True)
+    after_dupes = df.shape[0]
+    print(f"Removed {before_dupes - after_dupes} duplicate rows")
+
+    # 3. Detect columns types:
+    # - numeric: pandas numeric types
+    # - possible dates: object columns that look like dates or columns named 'date' etc.
+    # - object/text: df.select_dtypes(include='object'/'string')
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    object_cols = df.select_dtypes(include=['object', 'string']).columns.tolist()
+    bool_cols = df.select_dtypes(include=['bool']).columns.tolist()
+
+
+    date_cols = []
+    other_object_cols = []
+    for col in object_cols:
+        col_lower = col.lower()
+        sample = df[col].dropna().astype(str).head(100).tolist()
+        is_date_like = False
+        if "date" in col_lower or "day" in col_lower or "time" in col_lower:
+            is_date_like = True
+        else:
+            # quick check: if many samples parse with dateutil
+            parsed = 0
+            tries = min(60, len(sample))
+            for val in sample[:tries]:
+                try:
+                    _ = parse(val)
+                    parsed += 1
+                except Exception:
+                    pass
+            if tries > 0 and parsed / tries > 0.5:
+                is_date_like = True
+
+        if is_date_like:
+            date_cols.append(col)
+        else:
+            other_object_cols.append(col)
+
+    # Also check numeric-like object columns (e.g., 'Amount' stored as text)
+    for col in other_object_cols[:]:
+        # If most values can be coerced to numeric -> move to numeric
+        coerced = pd.to_numeric(df[col].dropna().astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce')
+        if coerced.notna().sum() / max(1, df[col].dropna().shape[0]) > 0.6:
+            # create numeric column and keep original as backup
+            print(f"Converting object column '{col}' -> numeric (detected numeric-like values)")
+            new_col = col + "_num"
+            df[new_col] = pd.to_numeric(df[col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce')
+            numeric_cols.append(new_col)
+            other_object_cols.remove(col)
+
+    # 4. Parse date columns
+    parsed_dates = []
+    for col in date_cols:
+        print(f"Parsing date column: {col}")
+        df[col] = try_parse_date_series(df[col])
+        parsed_dates.append(col)
+
+    # 5. Standardize text columns (the remaining object cols)
+    for col in other_object_cols:
+        print(f"Standardizing text column: {col}")
+        df[col] = standardize_text_series(df[col], column_name=col)
+
+    # 6. Standardize known email column names
+    for col in df.columns:
+        if col.lower() in ("email", "e-mail", "customeremail", "customer_email"):
+            try:
+                df[col] = df[col].astype("string").str.lower().str.strip()
+            except Exception:
+                pass
+
+    # 7. Fill missing values intelligently
+    # Recompute numeric & categorical lists
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    # treat small-unique object columns as categorical
+    categorical_cols = [c for c in df.select_dtypes(include=['object', 'string']).columns
+                        if df[c].nunique(dropna=True) <= MAX_UNIQUE_FOR_CATEGORY]
+    text_cols = [c for c in df.select_dtypes(include=['object', 'string']).columns if c not in categorical_cols]
+    print(f"Numeric columns detected: {numeric_cols}")
+    print(f"Categorical columns detected (to fill with mode): {categorical_cols}")
+    print(f"Text columns left as free text: {text_cols}")
+
+    df = fill_missing(df, numeric_cols, categorical_cols, parsed_dates)
+
+    # 8. Final tidying: trim whitespace from column names, lower snake_case optional
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 9. Create and save summary report
+    info = summarize_dataframe(df)
+    summary_df = pd.DataFrame({
+        "column": list(df.columns),
+        "dtype": [str(df[c].dtype) for c in df.columns],
+        "n_unique": [df[c].nunique(dropna=True) for c in df.columns],
+        "n_missing": [int(df[c].isna().sum()) for c in df.columns],
+        "pct_missing": [(df[c].isna().mean() * 100).round(2) for c in df.columns]
+    })
+
+    missing_report = df.isna().sum().sort_values(ascending=False).reset_index()
+    missing_report.columns = ["column", "n_missing"]
+
+    # Save cleaned file and report
+    print("Saving cleaned dataset to:", OUTPUT_CLEANED)
+    df.to_excel(OUTPUT_CLEANED, index=False)
+
+    print("Saving cleaning report to:", OUTPUT_REPORT)
+    with pd.ExcelWriter(OUTPUT_REPORT, engine='openpyxl') as writer:
+        summary_df.to_excel(writer, sheet_name="summary", index=False)
+        missing_report.to_excel(writer, sheet_name="missing_report", index=False)
+        # Save head & tail quick peek
+        df.head(200).to_excel(writer, sheet_name="sample_head", index=False)
+        df.tail(200).to_excel(writer, sheet_name="sample_tail", index=False)
+
+    # Console summary
+    print("\nCLEANING SUMMARY")
+    print(f"Rows: {info['rows']}, Columns: {info['columns']}")
+    print(f"Dropped columns: {cols_to_drop}")
+    print(f"Duplicate rows removed: {before_dupes - after_dupes}")
+    print("Top missing columns (by count):")
+    print(missing_report.head(10).to_string(index=False))
+
+    print("\nDone. Check the cleaned file and the report.")
+
+if __name__ == "__main__":
+    main()
